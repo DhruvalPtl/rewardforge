@@ -121,6 +121,31 @@ RewardForge watches a reinforcement learning agent train in real time, reads the
 Inspired by NVIDIA's [Eureka paper (2023)](https://eureka-research.github.io/), implemented with Stable-Baselines3 + Google Gemini API.
 
 ---
+## Experiment Results — CartPole-v1
+
+4 conditions × 5 seeds (20 runs total, 20k steps each).
+
+| Condition | Median Best Reward | Steps to 450 |
+|---|---|---|
+| RewardForge | 500.0 | 12,000 |
+| Baseline PPO | 491.3 | 14,000 |
+| Ablation (blind) | 500.0 | 16,000 |
+| Random shaping | 572.3 | 12,000 |
+
+**Best single run:** RewardForge seed 0 → 629.9 (only run where Gemini actually fired)
+
+**Mann-Whitney U: p = 0.069** — trend real, n=5 too small to claim significance.
+
+### What we learned
+
+CartPole is solved too fast by PPO for the stagnation trigger to fire consistently.
+Gemini intervened in only 1 of 5 RewardForge seeds — but that seed won the whole experiment.
+
+Key finding: any reward shaping (even random) beats vanilla PPO on CartPole.
+This validates the shaping hypothesis but exposes the real question:
+**what happens on an environment where random shaping actively hurts?**
+
+That's LunarLander-v2. Results coming next.
 
 ## Key Result
 

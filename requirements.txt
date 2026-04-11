@@ -1,4 +1,5 @@
 gymnasium
+gymnasium[box2d]          # LunarLander-v2 (box2d, pygame, swig)
 stable-baselines3
 google-generativeai
 python-dotenv
