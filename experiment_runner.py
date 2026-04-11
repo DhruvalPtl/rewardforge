@@ -2,9 +2,9 @@
 experiment_runner.py — Comparative experiments for RewardForge.
 
 Runs 20 total experiments:
-    rewardforge     — PPO + Gemini with full reward history
-    baseline_ppo    — PPO only, no shaping, no Gemini
-    ablation_blind  — Gemini triggered at same steps but NO history sent
+    rewardforge     — PPO + qwen3-32b (Groq) with full reward history
+    baseline_ppo    — PPO only, no shaping, no LLM
+    ablation_blind  — qwen3-32b triggered at same steps but NO history sent
     ablation_random — reward function replaced with randomly perturbed v0
 
 Usage:
@@ -154,10 +154,10 @@ class ExperimentCallback(BaseCallback):
     Single callback that drives all 4 experimental conditions.
 
     The only thing that varies by condition is what happens at trigger time:
-        rewardforge     → call Gemini with last-3 reward history
-        baseline_ppo    → never trigger
-        ablation_blind  → call Gemini with EMPTY history ([]); function only
-        ablation_random → replace with randomly perturbed function; no Gemini
+        rewardforge     -> call qwen3-32b with last-3 reward history
+        baseline_ppo    -> no LLM call at all
+        ablation_blind  -> call qwen3-32b with EMPTY history ([]); function only
+        ablation_random -> replace with randomly perturbed function; no LLM
     """
 
     def __init__(self, train_env: CustomCartPole, condition: Condition, seed: int):
@@ -178,7 +178,7 @@ class ExperimentCallback(BaseCallback):
         self.reward_history:   list[tuple[int, float]] = []
         self.reward_fn_history: list[str]  = [train_env.reward_fn_code]
         self.log_rows:          list[dict] = []
-        self.failure_log:       list[str]  = []   # Gemini failures, kept for analysis
+        self.failure_log:       list[str]  = []   # LLM failures, kept for analysis
         self.rewrite_count     = 0
         self.best_reward       = -float("inf")
         self.best_version      = 0
@@ -229,31 +229,28 @@ class ExperimentCallback(BaseCallback):
 
         # Condition-specific rewrite strategy
         if self.condition == "rewardforge":
-            return self._trigger_gemini(include_history=True)
+            return self._trigger_llm(include_history=True)
         elif self.condition == "ablation_blind":
-            return self._trigger_gemini(include_history=False)
+            return self._trigger_llm(include_history=False)
         elif self.condition == "ablation_random":
             return self._trigger_random()
         return False
 
-    def _trigger_gemini(self, include_history: bool) -> bool:
-        """Call Gemini.  include_history=False → ablation_blind condition."""
-        history = (
-            self.reward_history[-3:] if include_history else []
-        )
+    def _trigger_llm(self, include_history: bool) -> bool:
+        """Call qwen3-32b via Groq.  include_history=False -> ablation_blind condition."""
+        history = self.reward_history[-3:] if include_history else []
         try:
             result = request_new_reward_fn(
                 current_reward_fn_code=self.train_env.reward_fn_code,
                 reward_history=history,
             )
         except Exception as exc:
-            note = f"[step {self.reward_history[-1][0]}] Gemini API failure: {exc}"
+            note = f"[step {self.reward_history[-1][0]}] LLM API failure: {exc}"
             self.failure_log.append(note)
-            print(f"    ⚠️  {note}  → keeping current fn")
+            print(f"    WARNING  {note}")
             return False
-
         if result is None:
-            note = f"[step {self.reward_history[-1][0]}] Gemini returned unusable code"
+            note = f"[step {self.reward_history[-1][0]}] LLM returned unusable code"
             self.failure_log.append(note)
             return False
 
@@ -317,7 +314,7 @@ def _save_run(
         f.write(f"Best reward        : {cb.best_reward:.2f}\n")
         f.write(f"Best reward fn ver : v{cb.best_version}\n")
         if cb.failure_log:
-            f.write("\nGemini failures:\n")
+            f.write("\nLLM failures:\n")
             for note in cb.failure_log:
                 f.write(f"  {note}\n")
 
@@ -450,7 +447,7 @@ def generate_analysis(results: list[dict], out_path: Path) -> str:
         f"  vs ablation_blind  : p = {p_blind:.4f}"
         + ("  ← history context matters" if p_blind < 0.05 else "  ← history not decisive"),
         f"  vs ablation_random : p = {p_random:.4f}"
-        + ("  ← Gemini beats random"     if p_random < 0.05 else "  ← Gemini not sig. better than random"),
+        + ("  <- LLM beats random"     if p_random < 0.05 else "  <- LLM not sig. better than random"),
         "",
     ]
 
@@ -460,7 +457,7 @@ def generate_analysis(results: list[dict], out_path: Path) -> str:
     if p_val < 0.05:
         verdict = (
             f"✅  SIGNIFICANT — RewardForge outperformed baseline PPO "
-            f"(p = {p_val:.4f} < 0.05). Gemini-driven reward shaping produced "
+            f"(p = {p_val:.4f} < 0.05). LLM-driven reward shaping produced "
             f"a statistically significant gain in best reward over 5 seeds."
         )
     else:
@@ -472,16 +469,17 @@ def generate_analysis(results: list[dict], out_path: Path) -> str:
 
     lines.append(f"  {verdict}")
 
-    if p_blind >= 0.05:
+    if p_blind < 0.05:
         lines.append(
-            "  💡 History context (rewardforge vs ablation_blind) is not decisive — "
-            "Gemini seems to design reasonable shapes even without the reward curve."
+            "  History context matters: rewardforge significantly outperformed "
+            "ablation_blind, confirming the reward curve is useful signal for the LLM."
         )
     else:
         lines.append(
-            "  💡 History context matters: rewardforge significantly outperformed "
-            "ablation_blind, confirming the reward curve is useful signal for Gemini."
+            "  History context not decisive -- the LLM designs reasonable shapes "
+            "even without the reward curve."
         )
+
 
     text = "\n".join(lines) + "\n"
     out_path.write_text(text, encoding="utf-8")

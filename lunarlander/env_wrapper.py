@@ -70,7 +70,7 @@ class CustomLunarLander(gym.Wrapper):
         Monotonically increasing counter; bumped every time set_reward_fn()
         is called.
     reward_fn_code : str
-        Source code of the currently active reward function (sent to Gemini /
+        Source code of the currently active reward function (sent to the LLM /
         saved to disk).
 
     CHANGED FROM CARTPOLE VERSION:

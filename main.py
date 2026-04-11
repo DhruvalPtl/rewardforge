@@ -2,7 +2,7 @@
 RewardForge — main entry point.
 
 Trains PPO on CartPole-v1 and dynamically rewrites the reward function
-via Gemini when learning stagnates.
+via the LLM (qwen3-32b on Groq) when learning stagnates.
 """
 
 import json
@@ -25,7 +25,7 @@ from rewardforge_agent import request_new_reward_fn
 TOTAL_TIMESTEPS  = 20_000
 CHECKPOINT_EVERY = 2_000     # log / check every N steps
 IMPROVEMENT_PCT  = 10.0      # minimum % improvement expected
-MAX_REWRITES     = 3         # cap on Gemini calls per run
+MAX_REWRITES     = 3         # cap on LLM calls per run
 N_EVAL_EPISODES  = 10        # episodes used to measure mean reward
 GRACE_CHECKPOINTS = 1        # skip this many checkpoints after a rewrite before judging
 
@@ -147,7 +147,7 @@ class RewardForgeCallback(BaseCallback):
         return True
 
     def _trigger_rewrite(self):
-        """Call Gemini and swap the reward function if successful."""
+        """Call the LLM and swap the reward function if successful."""
         last_3 = self.reward_history[-3:] if len(self.reward_history) >= 3 else self.reward_history
         result = request_new_reward_fn(
             current_reward_fn_code=self.env.reward_fn_code,
@@ -168,7 +168,7 @@ class RewardForgeCallback(BaseCallback):
             print(f"🔄  Reward function updated → version {self.env.reward_fn_version}")
             print(f"  ⏳  Grace period started ({GRACE_CHECKPOINTS} checkpoint(s) before next trigger)")
         else:
-            print("⚠️  Keeping previous reward function (Gemini returned unusable code).")
+            print("⚠️  Keeping previous reward function (LLM returned unusable code).")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -264,7 +264,7 @@ def save_run(callback: RewardForgeCallback, env: CustomCartPole):
 # Main
 # ═══════════════════════════════════════════════════════════════════════════
 def main():
-    print("🚀  RewardForge — dynamic reward shaping with Gemini\n")
+    print("🚀  RewardForge — dynamic reward shaping with qwen3-32b (Groq)\n")
 
     # 1. Environment
     env = CustomCartPole()

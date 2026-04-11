@@ -27,7 +27,7 @@ class CustomCartPole(gym.Wrapper):
         is called.
     reward_fn_code : str
         Source code of the currently active reward function (for logging /
-        sending to Gemini).
+        sending to the LLM).
     """
 
     def __init__(self, **kwargs):
@@ -49,7 +49,7 @@ class CustomCartPole(gym.Wrapper):
             New reward function with signature
             ``(obs, action, reward, terminated, info) -> float``.
         source_code : str
-            Python source of *fn* (kept for logging & Gemini context).
+            Python source of *fn* (kept for logging & LLM context).
         """
         self.reward_fn = fn
         self.reward_fn_version += 1

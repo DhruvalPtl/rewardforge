@@ -6,16 +6,16 @@ lunarlander/experiment_runner.py — 4-condition scientific comparison on LunarL
 ║  CartPole experiment showed any shaping helps (even random).                ║
 ║  LunarLander is a harder environment where:                                  ║
 ║    • random shaping can steer the agent in a WRONG direction                 ║
-║    • blind Gemini (no history) may over-penalise and hurt learning           ║
+║    • blind qwen (no history) may over-penalise and hurt learning           ║
 ║    • RewardForge with full history should be the clear winner                ║
 ║  This is the paper's key result.                                             ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 
 Conditions
 ──────────────────────────────────────────────────────────────────────────────
-  rewardforge     PPO + Gemini with full reward curve history       [our method]
-  baseline_ppo    PPO only, no Gemini, built-in env reward          [control]
-  ablation_blind  Gemini triggered but receives NO history          [ablation]
+  rewardforge     PPO + qwen3-32b with full reward curve history      [our method]
+  baseline_ppo    PPO only, no LLM, built-in env reward               [control]
+  ablation_blind  qwen3-32b triggered but receives NO history          [ablation]
   ablation_random random shaping (random-sign coefficients)         [ablation]
 
 Literature Reference (no rerun needed)
@@ -42,7 +42,9 @@ import json
 import os
 import random
 import sys
+import time
 import warnings
+from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
@@ -66,17 +68,30 @@ from lunarlander.rewardforge_agent import request_new_reward_fn   # noqa: E402
 # ═══════════════════════════════════════════════════════════════════════════════
 # Configuration
 # ═══════════════════════════════════════════════════════════════════════════════
-TOTAL_TIMESTEPS   = 150_000   # slightly more than main.py to see convergence trends
+TOTAL_TIMESTEPS   = 300_000
 CHECKPOINT_EVERY  = 10_000
-LOOK_BACK         = 3         # compare current vs 3 ckpts ago (absolute delta)
-IMPROVEMENT_DELTA = 20.0      # trigger if reward hasn't gained 20 pts in 3 ckpts
-MAX_REWRITES      = 3
+LOOK_BACK         = 5         # was 3 -- compare over 50k steps for a stable signal
+IMPROVEMENT_DELTA = 25.0      # was 15 -- require bigger gain to avoid noise-triggering
+MAX_REWRITES      = 2         # was 3 -- fewer but better-timed rewrites
 N_EVAL_EPISODES   = 15
-GRACE_CHECKPOINTS = 1
+GRACE_CHECKPOINTS = 3         # was 2 -- more recovery time after each rewrite
+
+# NEW: guard rails to prevent LLM firing too early in training
+MIN_TRIGGER_STEP   = 150_000  # don't even consider triggering before 100k steps
+                               # (PPO needs ~100k to escape the random-policy floor)
+MIN_TRIGGER_REWARD = -150.0   # don't trigger if agent is still catastrophically bad
+                               # (LLM can't help if the agent hasn't learned to fly yet)
+
+# Rate limiting for llama-3.3-70b-versatile free tier:
+# TPM = 12,000/min.  llama does NOT do thinking, so one call = ~850 tokens
+# (700 prompt + 150 code).  12K / 850 = ~14 calls/min max.  10s gap = safe.
+LLM_CALL_DELAY_S = 10        # seconds to sleep before each LLM call
 
 SEEDS      = [0, 1, 2, 3, 4]
 CONDITIONS = ["rewardforge", "baseline_ppo", "ablation_blind", "ablation_random"]
-EXPR_ROOT  = _ROOT / "runs" / "experiments" / "lunarlander"
+# EXPR_ROOT is set inside main() with a timestamp so each run gets its own directory.
+# e.g.  runs/experiments/lunarlander/20260411_174600/
+_EXPR_BASE = _ROOT / "runs" / "experiments" / "lunarlander"
 
 Condition = Literal["rewardforge", "baseline_ppo", "ablation_blind", "ablation_random"]
 
@@ -234,41 +249,89 @@ class ExperimentCallback(BaseCallback):
         return True
 
     def _maybe_trigger(self, mean_rew: float) -> bool:
+        # baseline_ppo: never reshape
         if self.condition == "baseline_ppo":
             return False
+
+        # Grace period — wait for agent to adapt after last rewrite
         if self._grace_remaining > 0:
             self._grace_remaining -= 1
             return False
+
+        # Must have enough history to compare
         if len(self.reward_history) < LOOK_BACK + 1:
             return False
+
+        # Rewrites budget exhausted
         if self.rewrite_count >= MAX_REWRITES:
             return False
 
+        # NEW: Don't trigger before PPO has had time to learn the basics.
+        # Fires too early => LLM reshapes a random-walk policy, disrupting learning.
+        current_step = self.reward_history[-1][0]
+        if current_step < MIN_TRIGGER_STEP:
+            return False
+
+        # NEW: Don't trigger if agent is still in the catastrophic crash zone.
+        # -150 = barely above random policy; the LLM can only help once there
+        # is a signal to build on.
+        if mean_rew < MIN_TRIGGER_REWARD:
+            return False
+
+        # Stagnation check: not enough absolute improvement over LOOK_BACK ckpts
         old_rew = self.reward_history[-(LOOK_BACK + 1)][1]
         if (mean_rew - old_rew) >= IMPROVEMENT_DELTA:
-            return False   # improving fast enough
+            return False   # improving fast enough, no need to intervene
 
         if self.condition == "rewardforge":
-            return self._trigger_gemini(include_history=True)
+            return self._trigger_llm(include_history=True)
         elif self.condition == "ablation_blind":
-            return self._trigger_gemini(include_history=False)
+            return self._trigger_llm(include_history=False)
         elif self.condition == "ablation_random":
             return self._trigger_random()
         return False
 
-    def _trigger_gemini(self, include_history: bool) -> bool:
+    def _trigger_llm(self, include_history: bool) -> bool:
+        """
+        Call qwen3-32b (via Groq) with optional history.  Handles 429 quota errors with
+        exponential backoff (30s -> 60s -> 120s) before giving up.
+        A pre-call sleep of LLM_CALL_DELAY_S seconds is inserted to spread
+        requests across time and avoid bursting the free-tier RPM limit.
+        """
         history = self.reward_history[-LOOK_BACK:] if include_history else []
-        try:
-            result = request_new_reward_fn(
-                current_reward_fn_code=self.train_env.reward_fn_code,
-                reward_history=history,
-            )
-        except Exception as exc:
-            note = f"[step {self.reward_history[-1][0]:,}] Gemini failure: {exc}"
-            self.failure_log.append(note)
-            print(f"    ⚠️  {note}")
-            return False
+
+        print(f"    Waiting {LLM_CALL_DELAY_S}s before LLM call "
+              f"(rate-limit buffer) ...", flush=True)
+        time.sleep(LLM_CALL_DELAY_S)
+
+        max_attempts = 3
+        for attempt in range(1, max_attempts + 1):
+            try:
+                result = request_new_reward_fn(
+                    current_reward_fn_code=self.train_env.reward_fn_code,
+                    reward_history=history,
+                )
+                break   # success
+            except Exception as exc:
+                is_quota = "429" in str(exc) or "quota" in str(exc).lower()
+                if is_quota and attempt < max_attempts:
+                    wait = 30 * (2 ** attempt)   # 60s, 120s
+                    print(f"    ⚠️  429 quota hit — retrying in {wait}s "
+                          f"(attempt {attempt}/{max_attempts}) …", flush=True)
+                    time.sleep(wait)
+                    continue
+                note = (f"[step {self.reward_history[-1][0]:,}] "
+                        f"LLM failure (attempt {attempt}): {exc}")
+                self.failure_log.append(note)
+                print(f"    ⚠️  {note}  → keeping current fn")
+                return False
+        else:
+            return False   # all attempts exhausted
+
         if result is None:
+            self.failure_log.append(
+                f"[step {self.reward_history[-1][0]:,}] LLM returned unusable code"
+            )
             return False
         self._apply_rewrite(*result)
         return True
@@ -316,7 +379,7 @@ def _save_run(run_dir: Path, cb: ExperimentCallback, condition: str, seed: int) 
         f.write(f"Best reward        : {cb.best_reward:.2f}\n")
         f.write(f"Best reward fn ver : v{cb.best_version}\n")
         if cb.failure_log:
-            f.write("\nGemini failures:\n")
+            f.write("\nLLM failures:\n")
             for note in cb.failure_log:
                 f.write(f"  {note}\n")
 
@@ -443,7 +506,7 @@ def generate_analysis(results: list[dict], out_path: Path) -> str:
     lines += ["",
               f"  rewardforge vs ablation_blind (two-sided): p={p_hist:.4f}  "
               + ("← history context IS decisive" if p_hist < 0.05
-                 else "← history context not sig. (both use Gemini)")]
+                 else "<- history context not sig. (both use the LLM)")]
 
     # ── Plain-English conclusion ──────────────────────────────────────────────
     lines += ["", sep, "Conclusion:", sep]
@@ -454,13 +517,13 @@ def generate_analysis(results: list[dict], out_path: Path) -> str:
             f"(p < 0.05) on LunarLander-v3.\n"
             "     On this harder environment, reward function quality matters: "
             "random or blind\n"
-            "     shaping does not reliably help, while curve-aware Gemini design does."
+            "     shaping does not reliably help, while curve-aware LLM design does."
         )
     else:
         lines.append(
             "  ❌ NOT SIGNIFICANT — no pairwise comparison reached p<0.05.\n"
-            "     This may reflect insufficient training (150k vs 1M steps for full "
-            "convergence)\n"
+            f"     This may reflect insufficient training ({TOTAL_TIMESTEPS//1000}k vs 1M steps "
+            "for full convergence)\n"
             "     or n=5 being too small. Directional trend should still be visible."
         )
 
@@ -484,6 +547,9 @@ def generate_analysis(results: list[dict], out_path: Path) -> str:
 # Main driver
 # ═══════════════════════════════════════════════════════════════════════════════
 def main() -> None:
+    # ── Timestamped output directory — never overwrites previous runs ─────────
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    EXPR_ROOT = _EXPR_BASE / timestamp
     EXPR_ROOT.mkdir(parents=True, exist_ok=True)
 
     plan: list[tuple[Condition, int]] = [
@@ -495,7 +561,8 @@ def main() -> None:
     print("║   RewardForge — LunarLander Experiment Runner            ║")
     print("╚══════════════════════════════════════════════════════════╝")
     print(f"  {len(CONDITIONS)} conditions × {len(SEEDS)} seeds = {total} total runs")
-    print(f"  {TOTAL_TIMESTEPS:,} steps per run  |  output → {EXPR_ROOT}\n")
+    print(f"  {TOTAL_TIMESTEPS:,} steps per run")
+    print(f"  Output → {EXPR_ROOT}")
     print(f"  Literature reference: {LITERATURE_SOURCE}")
     print(f"  PPO @ {LITERATURE_STEPS:,} steps = {LITERATURE_MEAN:.1f} ± {LITERATURE_STD:.1f}\n")
 

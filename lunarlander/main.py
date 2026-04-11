@@ -2,7 +2,7 @@
 RewardForge — LunarLander-v2 main entry point.
 
 Trains PPO on LunarLander-v3 and dynamically rewrites the reward function
-via Gemini when learning stagnates.
+via the LLM (qwen3-32b on Groq) when learning stagnates.
 
 ╔══════════════════════════════════════════════════════════════════════════╗
 ║  DIFF vs CartPole main.py  (LunarLander-v3)                              ║
@@ -60,13 +60,17 @@ warnings.filterwarnings("ignore", category=UserWarning)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 # CHANGED FROM CARTPOLE: all values updated for LunarLander
-TOTAL_TIMESTEPS   = 100_000   # CartPole: 20_000  — LL needs 5–10× more
-CHECKPOINT_EVERY  = 10_000    # CartPole:  2_000  — fewer, wider checkpoints
-LOOK_BACK         = 3         # CartPole:      2  — compare vs 3 ckpts ago
-IMPROVEMENT_DELTA = 20.0      # CartPole: 10.0 %  — absolute pts (not %)
-MAX_REWRITES      = 3         # same as CartPole
-N_EVAL_EPISODES   = 15        # CartPole:     10  — LL has higher episode variance
-GRACE_CHECKPOINTS = 1         # same as CartPole
+TOTAL_TIMESTEPS   = 100_000
+CHECKPOINT_EVERY  = 10_000
+LOOK_BACK         = 5         # compare vs 5 ckpts ago (50k steps) for stable signal
+IMPROVEMENT_DELTA = 25.0      # require 25 pts absolute gain over 50k steps
+MAX_REWRITES      = 2         # fewer but better-timed rewrites
+N_EVAL_EPISODES   = 15
+GRACE_CHECKPOINTS = 3         # checkpoints to skip after each rewrite
+
+# Guard rails: don't trigger LLM during the noisy early-training phase
+MIN_TRIGGER_STEP   = 50_000   # in main.py (100k total), wait until half-way
+MIN_TRIGGER_REWARD = -150.0   # don't fire if agent is still catastrophically bad
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -164,25 +168,30 @@ class RewardForgeCallback(BaseCallback):
     # ── Stagnation check ─────────────────────────────────────────────────────
     def _maybe_trigger(self, mean_rew: float) -> bool:
         """
-        CHANGED FROM CARTPOLE:
-            CartPole: trigger if reward didn't improve by IMPROVEMENT_PCT %
-                      over the PREVIOUS checkpoint (LOOK_BACK=2).
-            LunarLander: trigger if absolute reward gain over the last
-                         LOOK_BACK checkpoints is < IMPROVEMENT_DELTA.
-                         This handles negative reward values correctly.
+        Trigger the LLM only when PPO is genuinely stuck AND has had enough
+        time to learn the basics (MIN_TRIGGER_STEP) AND is not in the
+        catastrophic crash zone (MIN_TRIGGER_REWARD).
         """
         if self._grace_remaining > 0:
             self._grace_remaining -= 1
             print(f"  ⏳  Grace period — skipping trigger ({self._grace_remaining} left)")
             return False
 
-        # Need LOOK_BACK + 1 data points to compare
         if len(self.reward_history) < LOOK_BACK + 1:
             return False
         if self.rewrite_count >= MAX_REWRITES:
             return False
 
-        # Absolute improvement over the last LOOK_BACK checkpoints
+        # Guard: wait until PPO has bootstrapped its own learning
+        current_step = self.reward_history[-1][0]
+        if current_step < MIN_TRIGGER_STEP:
+            return False
+
+        # Guard: don't fire if agent is still in the random-crash zone
+        if mean_rew < MIN_TRIGGER_REWARD:
+            return False
+
+        # Stagnation: absolute improvement over last LOOK_BACK checkpoints
         old_rew  = self.reward_history[-(LOOK_BACK + 1)][1]
         curr_rew = self.reward_history[-1][1]
         if (curr_rew - old_rew) >= IMPROVEMENT_DELTA:
@@ -192,7 +201,7 @@ class RewardForgeCallback(BaseCallback):
         return True
 
     def _trigger_rewrite(self) -> None:
-        """Call Gemini and hot-swap the reward function."""
+        """Call the LLM and hot-swap the reward function."""
         last_n = self.reward_history[-LOOK_BACK:]
         result = request_new_reward_fn(
             current_reward_fn_code=self.env.reward_fn_code,
@@ -210,7 +219,7 @@ class RewardForgeCallback(BaseCallback):
             print(f"🔄  Reward function → v{self.env.reward_fn_version}"
                   f"  ⏳ grace={GRACE_CHECKPOINTS}ckpt")
         else:
-            print("⚠️  Keeping previous reward function (Gemini returned unusable code).")
+            print("⚠️  Keeping previous reward function (LLM returned unusable code).")
 
     # ── Printing helpers (instance methods — no module-level globals) ─────────
     def _print_row(self, row: dict) -> None:
@@ -293,7 +302,7 @@ def save_run(callback: RewardForgeCallback, env: CustomLunarLander) -> None:
 # Main  (IDENTICAL STRUCTURE TO CARTPOLE VERSION)
 # ═══════════════════════════════════════════════════════════════════════════════
 def main() -> None:
-    print("🚀  RewardForge — LunarLander-v3 + Gemini reward shaping\n")
+    print("🚀  RewardForge — LunarLander-v3 + llama-3.3-70b reward shaping\n")
     print(f"    {TOTAL_TIMESTEPS:,} steps  |  checkpoint every {CHECKPOINT_EVERY:,}"
           f"  |  max {MAX_REWRITES} rewrites\n")
 
