@@ -7,6 +7,7 @@ via Gemini when learning stagnates.
 
 import json
 import os
+import warnings
 from datetime import datetime
 
 import numpy as np
@@ -32,19 +33,25 @@ GRACE_CHECKPOINTS = 1        # skip this many checkpoints after a rewrite before
 # ═══════════════════════════════════════════════════════════════════════════
 # Evaluation helper
 # ═══════════════════════════════════════════════════════════════════════════
-def evaluate_mean_reward(model, env, n_episodes: int = N_EVAL_EPISODES) -> float:
-    """Roll out *n_episodes* and return the mean total reward."""
+def evaluate_mean_reward(model, eval_env, n_episodes: int = N_EVAL_EPISODES) -> float:
+    """Roll out *n_episodes* on *eval_env* and return the mean total reward.
+
+    Uses a dedicated eval environment (not the training env) so we never
+    call step() on an env that SB3's training loop owns mid-rollout.
+    """
     rewards = []
-    for _ in range(n_episodes):
-        obs, _ = env.reset()
-        total = 0.0
-        done = False
-        while not done:
-            action, _ = model.predict(obs, deterministic=True)
-            obs, reward, terminated, truncated, _ = env.step(action)
-            total += reward
-            done = terminated or truncated
-        rewards.append(total)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")   # suppress any gymnasium lifecycle warnings
+        for _ in range(n_episodes):
+            obs, _ = eval_env.reset()
+            total = 0.0
+            done = False
+            while not done:
+                action, _ = model.predict(obs, deterministic=True)
+                obs, reward, terminated, truncated, _ = eval_env.step(action)
+                total += reward
+                done = terminated or truncated
+            rewards.append(total)
     return float(np.mean(rewards))
 
 
@@ -84,6 +91,11 @@ class RewardForgeCallback(BaseCallback):
     def __init__(self, env: CustomCartPole, verbose=0):
         super().__init__(verbose)
         self.env = env
+        # Private eval env — isolated from the training env so we never
+        # call step() on an env SB3 currently owns mid-rollout.
+        self._eval_env = CustomCartPole()
+        self._eval_env.reward_fn = env.reward_fn          # sync reward fn
+        self._eval_env.reward_fn_code = env.reward_fn_code
         self.checkpoint_every = CHECKPOINT_EVERY
         self.reward_history: list[tuple[int, float]] = []
         self.rewrite_count = 0
@@ -99,8 +111,8 @@ class RewardForgeCallback(BaseCallback):
         if self.num_timesteps % self.checkpoint_every != 0:
             return True
 
-        # ── Evaluate ─────────────────────────────────────────────────
-        mean_rew = evaluate_mean_reward(self.model, self.env)
+        # ── Evaluate (on the private eval env, not the training env) ─
+        mean_rew = evaluate_mean_reward(self.model, self._eval_env)
         step = self.num_timesteps
         self.reward_history.append((step, mean_rew))
 
@@ -144,6 +156,9 @@ class RewardForgeCallback(BaseCallback):
         if result is not None:
             fn, code = result
             self.env.set_reward_fn(fn, code)
+            # Keep eval env in sync with training env's reward function
+            self._eval_env.reward_fn = fn
+            self._eval_env.reward_fn_code = code
             self.rewrite_count += 1
             self.reward_fn_history.append(code)
             # Reset value network so old value estimates don't corrupt learning

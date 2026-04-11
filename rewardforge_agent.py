@@ -6,8 +6,11 @@ the RL agent's learning stagnates.
 import os
 import re
 import textwrap
+import warnings
 
-import google.generativeai as genai
+with warnings.catch_warnings():
+    warnings.simplefilter("ignore", FutureWarning)
+    import google.generativeai as genai
 from dotenv import load_dotenv
 
 load_dotenv()

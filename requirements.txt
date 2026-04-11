@@ -3,3 +3,4 @@ stable-baselines3
 google-generativeai
 python-dotenv
 numpy
+scipy
