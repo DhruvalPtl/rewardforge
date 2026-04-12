@@ -66,6 +66,7 @@ from lunarlander.rewardforge_agent import request_new_reward_fn   # noqa: E402
 from lunarlander.curriculum_agent  import (                       # noqa: E402
     BLEND_STEPS, STAGE1_GATE, STAGE1_WAIT,
     CurriculumState, make_blended_fn, request_curriculum_fns,
+    SingleFnState, make_single_blend_fn, request_single_fn,
 )
 
 
@@ -94,12 +95,20 @@ MIN_TRIGGER_REWARD = 0.0      # agent must be positive -- hovering, not crashing
 LLM_CALL_DELAY_S = 10        # seconds to sleep before each LLM call
 
 SEEDS      = list(range(10))    # seeds 0-9 (v5 — doubled for statistical power)
-CONDITIONS = ["rewardforge", "baseline_ppo", "ablation_blind", "ablation_random"]
-# EXPR_ROOT is set inside main() with a timestamp so each run gets its own directory.
-# e.g.  runs/experiments/lunarlander/20260411_174600/
+CONDITIONS = ["rewardforge", "baseline_ppo", "ablation_blind",
+               "ablation_random", "llm_single"]
+
+# Human-readable label appended to the experiment folder name.
+# Change this whenever you change the experiment setup so folders are identifiable.
+# e.g. "v6_curriculum", "v7_curriculum_llm_single", "debug_3seeds"
+RUN_LABEL  = "v7_curriculum_llm_single"   # <-- update before each run
+
+# EXPR_ROOT is set inside main() with a timestamp + label.
+# e.g.  runs/experiments/lunarlander/20260412_181054_v7_curriculum_llm_single/
 _EXPR_BASE = _ROOT / "runs" / "experiments" / "lunarlander"
 
-Condition = Literal["rewardforge", "baseline_ppo", "ablation_blind", "ablation_random"]
+Condition = Literal["rewardforge", "baseline_ppo", "ablation_blind",
+                    "ablation_random", "llm_single"]
 
 # ── Literature reference constants (hardcoded — no rerun needed) ──────────────
 # SB3 Zoo PPO LunarLander-v2 after 1,000,000 steps
@@ -235,17 +244,25 @@ class ExperimentCallback(BaseCallback):
         self.best_version       = 0
         self._grace_remaining   = 0
 
-        # ── Curriculum state (rewardforge condition only, v6) ─────────────────
-        self._curr_state  = None    # CurriculumState | None
-        self._curr_fns    = None    # (survive_fn, approach_fn, land_fn) | None
-        self._curr_codes  = None    # {"survive": str, ...} | None
+        # ── Curriculum state (rewardforge only, v6) ─────────────────────────────
+        self._curr_state  = None
+        self._curr_fns    = None
+        self._curr_codes  = None
+        # ── llm_single state ───────────────────────────────────────────────────
+        self._single_state = None   # SingleFnState | None
+        self._single_code  = None
+
         if condition == "rewardforge":
             self._init_curriculum()
+        elif condition == "llm_single":
+            self._init_single()
 
     def _on_step(self) -> bool:
-        # Curriculum blend tick (every step, only for rewardforge)
+        # Curriculum / warmup blend tick (every step)
         if self.condition == "rewardforge" and self._curr_state is not None:
             self._tick_blend()
+        elif self.condition == "llm_single" and self._single_state is not None:
+            self._tick_single()
 
         if self.num_timesteps % CHECKPOINT_EVERY != 0:
             return True
@@ -258,9 +275,11 @@ class ExperimentCallback(BaseCallback):
             self.best_reward  = mean_rew
             self.best_version = self.train_env.reward_fn_version
 
-        # Trigger routing: curriculum for rewardforge; hover-trap for ablations
+        # Trigger routing
         if self.condition == "rewardforge":
             triggered = self._check_curriculum_advance(mean_rew, step)
+        elif self.condition == "llm_single":
+            triggered = False    # no mid-run triggers; LLM called once at init
         else:
             triggered = self._maybe_trigger(mean_rew)
 
@@ -443,6 +462,37 @@ class ExperimentCallback(BaseCallback):
                     self._start_blend(from_alpha=1.0, to_alpha=2.0)
                     return True
         return False
+    # ── llm_single management ─────────────────────────────────────────────────
+    def _init_single(self) -> None:
+        """Pre-training: call LLM once for the best single reward function."""
+        result = request_single_fn()
+        if result is None:
+            print("  \u26a0\ufe0f  llm_single failed \u2014 using base reward.")
+            return
+        fn, code = result
+        self._single_code  = code
+        self._single_state = SingleFnState()
+        blended = make_single_blend_fn(fn, self._single_state)
+        label   = "llm_single:warmup"
+        self.train_env.reward_fn      = blended
+        self.train_env.reward_fn_code = label
+        self._eval_env.reward_fn      = blended
+        self._eval_env.reward_fn_code = label
+        print(f"  llm_single warmup: alpha 0->1 over {BLEND_STEPS:,} steps")
+
+    def _tick_single(self) -> None:
+        """Called every step. Warms up alpha 0->1 over BLEND_STEPS, then stays."""
+        st = self._single_state
+        if not st.blending:
+            return
+        elapsed  = self.num_timesteps - st.blend_start_step
+        st.alpha = min(1.0, elapsed / BLEND_STEPS)
+        if elapsed >= BLEND_STEPS:
+            st.blending = False
+            st.advances = 1
+            print(f"\n    llm_single: full shaping active @ step {self.num_timesteps:,}")
+
+
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -512,9 +562,12 @@ def run_single(condition: Condition, seed: int, run_dir: Path) -> dict:
 
     _save_run(run_dir, cb, condition, seed)
 
-    triggers = (cb._curr_state.advances
-                if condition == "rewardforge" and cb._curr_state is not None
-                else cb.rewrite_count)
+    if condition == "rewardforge" and cb._curr_state is not None:
+        triggers = cb._curr_state.advances
+    elif condition == "llm_single" and cb._single_state is not None:
+        triggers = cb._single_state.advances
+    else:
+        triggers = cb.rewrite_count
     return {
         "condition":      condition,
         "seed":           seed,
@@ -606,6 +659,16 @@ def generate_analysis(results: list[dict], out_path: Path) -> str:
               + ("← history context IS decisive" if p_hist < 0.05
                  else "<- history context not sig. (both use the LLM)")]
 
+    # ── Key ablation: does three-stage curriculum beat single LLM fn? ─────────
+    if "llm_single" in CONDITIONS:
+        single_best = [r["best_reward"] for r in results if r["condition"] == "llm_single"]
+        if single_best and rf_best:
+            _, p_struct = sp_stats.mannwhitneyu(rf_best, single_best, alternative="two-sided")
+            sig_struct  = "curriculum IS decisive" if p_struct < 0.05 else "curriculum not sig. vs single fn"
+            lines += ["",
+                      f"  rewardforge vs llm_single (two-sided): p={p_struct:.4f}"
+                      f"  <- {sig_struct}"]
+
     # ── Plain-English conclusion ──────────────────────────────────────────────
     lines += ["", sep, "Conclusion:", sep]
 
@@ -645,10 +708,33 @@ def generate_analysis(results: list[dict], out_path: Path) -> str:
 # Main driver
 # ═══════════════════════════════════════════════════════════════════════════════
 def main() -> None:
-    # ── Timestamped output directory — never overwrites previous runs ─────────
+    # ── Timestamped + labelled output directory ───────────────────────────────
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    EXPR_ROOT = _EXPR_BASE / timestamp
+    folder    = f"{timestamp}_{RUN_LABEL}" if RUN_LABEL else timestamp
+    EXPR_ROOT = _EXPR_BASE / folder
     EXPR_ROOT.mkdir(parents=True, exist_ok=True)
+
+    # Write a self-documenting metadata file so any folder is identifiable
+    with open(EXPR_ROOT / "experiment_metadata.json", "w", encoding="utf-8") as f:
+        json.dump({
+            "run_label":       RUN_LABEL,
+            "timestamp":       timestamp,
+            "folder":          folder,
+            "conditions":      CONDITIONS,
+            "seeds":           SEEDS,
+            "total_timesteps": TOTAL_TIMESTEPS,
+            "checkpoint_every": CHECKPOINT_EVERY,
+            "look_back":       LOOK_BACK,
+            "improvement_delta": IMPROVEMENT_DELTA,
+            "max_rewrites":    MAX_REWRITES,
+            "min_trigger_step": MIN_TRIGGER_STEP,
+            "min_trigger_reward": MIN_TRIGGER_REWARD,
+            "blend_steps":     BLEND_STEPS,
+            "stage1_gate":     STAGE1_GATE,
+            "stage1_wait":     STAGE1_WAIT,
+            "model":           "llama-3.3-70b-versatile",
+            "n_eval_episodes": N_EVAL_EPISODES,
+        }, f, indent=2)
 
     plan: list[tuple[Condition, int]] = [
         (cond, seed) for cond in CONDITIONS for seed in SEEDS
