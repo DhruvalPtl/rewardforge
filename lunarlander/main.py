@@ -60,17 +60,17 @@ warnings.filterwarnings("ignore", category=UserWarning)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 # CHANGED FROM CARTPOLE: all values updated for LunarLander
-TOTAL_TIMESTEPS   = 100_000
+TOTAL_TIMESTEPS   = 150_000   # single-run preview: 150k shows hover trap clearly
 CHECKPOINT_EVERY  = 10_000
-LOOK_BACK         = 5         # compare vs 5 ckpts ago (50k steps) for stable signal
-IMPROVEMENT_DELTA = 25.0      # require 25 pts absolute gain over 50k steps
-MAX_REWRITES      = 2         # fewer but better-timed rewrites
+LOOK_BACK         = 3         # compare vs 3 checkpoints ago (30k steps)
+IMPROVEMENT_DELTA = 10.0      # < 10 pts gain over 30k steps = hover trap
+MAX_REWRITES      = 2
 N_EVAL_EPISODES   = 15
-GRACE_CHECKPOINTS = 3         # checkpoints to skip after each rewrite
+GRACE_CHECKPOINTS = 3
 
-# Guard rails: don't trigger LLM during the noisy early-training phase
-MIN_TRIGGER_STEP   = 50_000   # in main.py (100k total), wait until half-way
-MIN_TRIGGER_REWARD = -150.0   # don't fire if agent is still catastrophically bad
+# Hover-trap trigger guards (must match experiment_runner.py)
+MIN_TRIGGER_STEP   = 80_000   # past the early random-crash phase
+MIN_TRIGGER_REWARD = 0.0      # agent must be past 0 -- hovering, not crashing
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

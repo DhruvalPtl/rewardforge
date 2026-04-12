@@ -43,7 +43,7 @@ _CLIENT = Groq(api_key=os.getenv("GROQ_API_KEY"))
 # llama-3.3-70b-versatile: 30 RPM, 1K RPD, 12K TPM, 100K TPD (free tier)
 # No thinking overhead -- responses are compact, ~850 tokens total per call.
 _MODEL = "llama-3.3-70b-versatile"
-
+# _MODEL = "qwen/qwen3-32b"
 
 # ── Prompt template ───────────────────────────────────────────────────────────
 # CHANGED FROM CARTPOLE: fully rewritten for LunarLander-v3:
@@ -75,12 +75,19 @@ Current reward function:
 Training progress:
 {reward_history}
 
-The agent is struggling. Write a new reward function to accelerate learning.
+Diagnosed failure mode:
+{failure_mode}
+
+The agent is struggling. Write a new reward function to fix this specific failure mode.
 
 RULES:
 1. Use `reward` as the base. Add shaping bonuses ON TOP.
 2. Each shaping term: abs value <= 0.5/step. Total shaping: [-1.0, +1.0]/step.
-   Safe example: shaping = -0.2*abs(obs[0]) - 0.15*abs(obs[4])  (total ~-0.5 max)
+   Example that incentivises landing (use this style when hovering is the problem):
+     leg_bonus    = 0.4 * (obs[6] + obs[7])          # reward both legs touching
+     descent_bon  = 0.3 * max(0, -obs[3]) * max(0, 1 - obs[1])  # falling near ground
+     drift_pen    = -0.1 * abs(obs[0])                # stay above pad
+     shaping = leg_bonus + descent_bon + drift_pen    # total stays within +-1.0
 3. If terminated: return `reward` unchanged (it already has the +-100 landing bonus).
 4. No imports. Pure Python arithmetic only.
 
@@ -111,6 +118,28 @@ def request_new_reward_fn(
     (fn, source_code) or None
         None means the LLM returned unusable code; caller keeps current fn.
     """
+    # ── Diagnosed failure mode ────────────────────────────────────────────────
+    # Infer from the most recent reward value whether the agent is hovering.
+    # This diagnosis is embedded in the prompt so the LLM writes the right fix.
+    current_reward = reward_history[-1][1] if reward_history else None
+    if current_reward is not None and 50.0 <= current_reward <= 180.0:
+        failure_mode = (
+            "HOVER TRAP DETECTED — agent is likely hovering stably but not landing "
+            "(reward stuck in the 50-180 range). "
+            "The built-in +10/step leg-contact reward is not enough to break this. "
+            "Strongly incentivize landing: "
+            "add a bonus proportional to obs[6]+obs[7] (leg contact), "
+            "and reward controlled descent when obs[3] < 0 (falling) AND obs[1] < 0.5 "
+            "(near the ground). Do NOT just add more flight-quality penalties — "
+            "the agent already knows how to fly; it needs to WANT to land."
+        )
+    else:
+        failure_mode = (
+            "General stagnation — the agent is not improving. "
+            "Penalise instability (tilt, horizontal drift, angular velocity) "
+            "and reward progress toward the landing pad."
+        )
+
     history_str = "\n".join(
         f"  Step {step:>7,}: mean_reward = {mr:+.2f}"
         for step, mr in reward_history
@@ -119,6 +148,7 @@ def request_new_reward_fn(
     prompt = _PROMPT_TEMPLATE.format(
         current_reward_fn_code=current_reward_fn_code,
         reward_history=history_str,
+        failure_mode=failure_mode,
     )
 
     print(f"\n🔮  Calling Groq ({_MODEL}) for a new reward function …")

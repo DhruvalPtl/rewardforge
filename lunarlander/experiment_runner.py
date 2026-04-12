@@ -68,26 +68,28 @@ from lunarlander.rewardforge_agent import request_new_reward_fn   # noqa: E402
 # ═══════════════════════════════════════════════════════════════════════════════
 # Configuration
 # ═══════════════════════════════════════════════════════════════════════════════
-TOTAL_TIMESTEPS   = 300_000
+TOTAL_TIMESTEPS   = 500_000   # 500k -- enough for hover-trap to manifest and be fixed
 CHECKPOINT_EVERY  = 10_000
-LOOK_BACK         = 5         # was 3 -- compare over 50k steps for a stable signal
-IMPROVEMENT_DELTA = 25.0      # was 15 -- require bigger gain to avoid noise-triggering
-MAX_REWRITES      = 2         # was 3 -- fewer but better-timed rewrites
+LOOK_BACK         = 3         # compare vs 3 checkpoints ago (30k steps)
+IMPROVEMENT_DELTA = 10.0      # < 10 pts gain over 30k steps = genuinely stagnating
+MAX_REWRITES      = 2
 N_EVAL_EPISODES   = 15
-GRACE_CHECKPOINTS = 3         # was 2 -- more recovery time after each rewrite
+GRACE_CHECKPOINTS = 3         # 30k steps of recovery after each rewrite
 
-# NEW: guard rails to prevent LLM firing too early in training
-MIN_TRIGGER_STEP   = 150_000  # don't even consider triggering before 100k steps
-                               # (PPO needs ~100k to escape the random-policy floor)
-MIN_TRIGGER_REWARD = -150.0   # don't trigger if agent is still catastrophically bad
-                               # (LLM can't help if the agent hasn't learned to fly yet)
+# ── Hover-trap trigger: all three must be true simultaneously ─────────────────
+# The hover trap: agent learns to float (reward 0-100) but never lands.
+# It only emerges AFTER the agent has left the crash zone (reward > 0)
+# and AFTER enough time for PPO to reach a stable plateau (step > 80k).
+MIN_TRIGGER_STEP   = 80_000   # past the early random-crash phase
+MIN_TRIGGER_REWARD = 0.0      # agent must be positive -- hovering, not crashing
+                               # (below 0 = still in random-walk territory, LLM can't help)
 
 # Rate limiting for llama-3.3-70b-versatile free tier:
 # TPM = 12,000/min.  llama does NOT do thinking, so one call = ~850 tokens
 # (700 prompt + 150 code).  12K / 850 = ~14 calls/min max.  10s gap = safe.
 LLM_CALL_DELAY_S = 10        # seconds to sleep before each LLM call
 
-SEEDS      = [0, 1, 2, 3, 4]
+SEEDS      = list(range(10))    # seeds 0-9 (v5 — doubled for statistical power)
 CONDITIONS = ["rewardforge", "baseline_ppo", "ablation_blind", "ablation_random"]
 # EXPR_ROOT is set inside main() with a timestamp so each run gets its own directory.
 # e.g.  runs/experiments/lunarlander/20260411_174600/
@@ -134,7 +136,9 @@ def _reset_value_head(model: PPO) -> None:
 # ═══════════════════════════════════════════════════════════════════════════════
 # Evaluation helper
 # ═══════════════════════════════════════════════════════════════════════════════
-def _evaluate(model: PPO, eval_env: CustomLunarLander, n: int = N_EVAL_EPISODES) -> float:
+def _evaluate(model: PPO, eval_env: CustomLunarLander, n: int = N_EVAL_EPISODES
+              ) -> tuple[float, float]:
+    """Roll out n episodes; return (mean_reward, std_reward)."""
     rewards = []
     for _ in range(n):
         obs, _ = eval_env.reset()
@@ -145,7 +149,7 @@ def _evaluate(model: PPO, eval_env: CustomLunarLander, n: int = N_EVAL_EPISODES)
             total += r
             done = terminated or truncated
         rewards.append(total)
-    return float(np.mean(rewards))
+    return float(np.mean(rewards)), float(np.std(rewards))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -232,7 +236,7 @@ class ExperimentCallback(BaseCallback):
         if self.num_timesteps % CHECKPOINT_EVERY != 0:
             return True
 
-        mean_rew = _evaluate(self.model, self._eval_env)
+        mean_rew, std_rew = _evaluate(self.model, self._eval_env)
         step = self.num_timesteps
         self.reward_history.append((step, mean_rew))
 
@@ -242,46 +246,46 @@ class ExperimentCallback(BaseCallback):
 
         triggered = self._maybe_trigger(mean_rew)
         self.log_rows.append({
-            "step": step, "mean_reward": mean_rew,
+            "step": step, "mean_reward": mean_rew, "std_reward": std_rew,
             "version": self.train_env.reward_fn_version,
             "triggered": "YES" if triggered else "",
         })
         return True
 
     def _maybe_trigger(self, mean_rew: float) -> bool:
-        # baseline_ppo: never reshape
+        """
+        Hover-trap detector: fires LLM when ALL THREE conditions hold:
+
+          1. step >= MIN_TRIGGER_STEP (80k)  — past the early chaotic crash phase
+          2. mean_rew >= MIN_TRIGGER_REWARD (0.0) — agent is hovering, not crashing
+          3. improvement over last LOOK_BACK checkpoints < IMPROVEMENT_DELTA (10 pts)
+                                             — genuinely stagnating at the hover plateau
+
+        This pinpoints the hover trap: the agent learned to float to avoid the
+        -100 crash penalty but can't break through to a soft landing (+100 bonus).
+        The LLM intervenes exactly here with a landing-encouraging shaping term.
+        """
+        # -- Hard gates --
         if self.condition == "baseline_ppo":
             return False
-
-        # Grace period — wait for agent to adapt after last rewrite
         if self._grace_remaining > 0:
             self._grace_remaining -= 1
             return False
-
-        # Must have enough history to compare
+        if self.rewrite_count >= MAX_REWRITES:
+            return False
         if len(self.reward_history) < LOOK_BACK + 1:
             return False
 
-        # Rewrites budget exhausted
-        if self.rewrite_count >= MAX_REWRITES:
-            return False
-
-        # NEW: Don't trigger before PPO has had time to learn the basics.
-        # Fires too early => LLM reshapes a random-walk policy, disrupting learning.
         current_step = self.reward_history[-1][0]
-        if current_step < MIN_TRIGGER_STEP:
-            return False
 
-        # NEW: Don't trigger if agent is still in the catastrophic crash zone.
-        # -150 = barely above random policy; the LLM can only help once there
-        # is a signal to build on.
-        if mean_rew < MIN_TRIGGER_REWARD:
-            return False
+        # -- Hover-trap: three conditions must ALL be true --
+        step_ready   = current_step >= MIN_TRIGGER_STEP   # past random-crash phase
+        hover_zone   = mean_rew     >= MIN_TRIGGER_REWARD  # positive = hovering
+        old_rew      = self.reward_history[-(LOOK_BACK + 1)][1]
+        stagnating   = (mean_rew - old_rew) < IMPROVEMENT_DELTA  # < 10 pts / 30k steps
 
-        # Stagnation check: not enough absolute improvement over LOOK_BACK ckpts
-        old_rew = self.reward_history[-(LOOK_BACK + 1)][1]
-        if (mean_rew - old_rew) >= IMPROVEMENT_DELTA:
-            return False   # improving fast enough, no need to intervene
+        if not (step_ready and hover_zone and stagnating):
+            return False   # not in hover trap yet -- let PPO keep learning
 
         if self.condition == "rewardforge":
             return self._trigger_llm(include_history=True)
@@ -359,9 +363,9 @@ def _save_run(run_dir: Path, cb: ExperimentCallback, condition: str, seed: int) 
 
     with open(run_dir / "training_log.csv", "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        w.writerow(["step", "mean_reward", "reward_fn_version", "triggered"])
+        w.writerow(["step", "mean_reward", "std_reward", "reward_fn_version", "triggered"])
         for row in cb.log_rows:
-            w.writerow([row["step"], f"{row['mean_reward']:.4f}",
+            w.writerow([row["step"], f"{row['mean_reward']:.4f}", f"{row['std_reward']:.4f}",
                         f"v{row['version']}", row["triggered"]])
 
     with open(run_dir / "summary.txt", "w", encoding="utf-8") as f:
@@ -427,6 +431,7 @@ def run_single(condition: Condition, seed: int, run_dir: Path) -> dict:
         "steps_to_200":   steps_to_200,
         "total_triggers": cb.rewrite_count,
         "final_reward":   final_reward,
+        "final_std":      cb.log_rows[-1]["std_reward"] if cb.log_rows else 0.0,
     }
 
 
@@ -587,7 +592,7 @@ def main() -> None:
     # ── results_summary.csv ───────────────────────────────────────────────────
     csv_path = EXPR_ROOT / "results_summary.csv"
     fields = ["condition", "seed", "best_reward", "steps_to_0",
-              "steps_to_100", "steps_to_200", "total_triggers", "final_reward"]
+              "steps_to_100", "steps_to_200", "total_triggers", "final_reward", "final_std"]
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()
