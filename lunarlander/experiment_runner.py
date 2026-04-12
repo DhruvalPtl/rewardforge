@@ -63,6 +63,10 @@ sys.path.insert(0, str(_ROOT))
 
 from lunarlander.env_wrapper       import CustomLunarLander       # noqa: E402
 from lunarlander.rewardforge_agent import request_new_reward_fn   # noqa: E402
+from lunarlander.curriculum_agent  import (                       # noqa: E402
+    BLEND_STEPS, STAGE1_GATE, STAGE1_WAIT,
+    CurriculumState, make_blended_fn, request_curriculum_fns,
+)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -220,7 +224,6 @@ class ExperimentCallback(BaseCallback):
         self._eval_env.reward_fn      = train_env.reward_fn
         self._eval_env.reward_fn_code = train_env.reward_fn_code
 
-        # Seeded RNG for ablation_random (independent per seed)
         self._rng = np.random.RandomState(seed * 137 + 53)
 
         self.reward_history:    list[tuple[int, float]] = []
@@ -232,7 +235,18 @@ class ExperimentCallback(BaseCallback):
         self.best_version       = 0
         self._grace_remaining   = 0
 
+        # ── Curriculum state (rewardforge condition only, v6) ─────────────────
+        self._curr_state  = None    # CurriculumState | None
+        self._curr_fns    = None    # (survive_fn, approach_fn, land_fn) | None
+        self._curr_codes  = None    # {"survive": str, ...} | None
+        if condition == "rewardforge":
+            self._init_curriculum()
+
     def _on_step(self) -> bool:
+        # Curriculum blend tick (every step, only for rewardforge)
+        if self.condition == "rewardforge" and self._curr_state is not None:
+            self._tick_blend()
+
         if self.num_timesteps % CHECKPOINT_EVERY != 0:
             return True
 
@@ -244,7 +258,12 @@ class ExperimentCallback(BaseCallback):
             self.best_reward  = mean_rew
             self.best_version = self.train_env.reward_fn_version
 
-        triggered = self._maybe_trigger(mean_rew)
+        # Trigger routing: curriculum for rewardforge; hover-trap for ablations
+        if self.condition == "rewardforge":
+            triggered = self._check_curriculum_advance(mean_rew, step)
+        else:
+            triggered = self._maybe_trigger(mean_rew)
+
         self.log_rows.append({
             "step": step, "mean_reward": mean_rew, "std_reward": std_rew,
             "version": self.train_env.reward_fn_version,
@@ -354,6 +373,77 @@ class ExperimentCallback(BaseCallback):
         self._grace_remaining = GRACE_CHECKPOINTS
         print(f"    🔄 v{self.train_env.reward_fn_version}  ⏳ grace={GRACE_CHECKPOINTS}ckpt")
 
+    # ── Curriculum management (rewardforge only) ─────────────────────────────
+    def _init_curriculum(self) -> None:
+        """Pre-training: call LLM once for 3 staged functions."""
+        result = request_curriculum_fns()
+        if result is None:
+            print("  ⚠️  Curriculum failed — rewardforge will use base reward.")
+            return
+        survive_fn, approach_fn, land_fn, codes = result
+        self._curr_fns   = (survive_fn, approach_fn, land_fn)
+        self._curr_codes = codes
+        self._curr_state = CurriculumState()
+        # Install blended closure on both envs (reads alpha from state at call-time)
+        blended = make_blended_fn(self._curr_fns, self._curr_state)
+        label   = "curriculum:stage0_survive"
+        self.train_env.reward_fn      = blended
+        self.train_env.reward_fn_code = label
+        self._eval_env.reward_fn      = blended
+        self._eval_env.reward_fn_code = label
+
+    def _tick_blend(self) -> None:
+        """Called every step. Updates curriculum alpha during a blend."""
+        st = self._curr_state
+        if not st.blending:
+            return
+        elapsed  = self.num_timesteps - st.blend_start_step
+        progress = min(1.0, elapsed / BLEND_STEPS)
+        st.alpha = st.blend_from + progress * (st.blend_to - st.blend_from)
+        if elapsed >= BLEND_STEPS:
+            st.blending = False
+            st.stage    = int(round(st.blend_to))
+            st.alpha    = st.blend_to
+            st.advances += 1
+            names = {0: "survive", 1: "approach", 2: "land"}
+            print(f"\n    🎓 Stage {st.stage} ({names[st.stage]}) "
+                  f"fully active @ step {self.num_timesteps:,}")
+
+    def _start_blend(self, from_alpha: float, to_alpha: float) -> None:
+        """Initiate a curriculum stage transition."""
+        st = self._curr_state
+        st.blending         = True
+        st.blend_from       = from_alpha
+        st.blend_to         = to_alpha
+        st.blend_start_step = self.num_timesteps
+        names = {0: "survive", 1: "approach", 2: "land"}
+        fs, ts = int(round(from_alpha)), int(round(to_alpha))
+        print(f"\n    🎓 Blending {names[fs]}→{names[ts]} "
+              f"over {BLEND_STEPS:,} steps …")
+
+    def _check_curriculum_advance(self, mean_rew: float, step: int) -> bool:
+        """Checkpoint-level: decide whether to advance curriculum stage."""
+        st = self._curr_state
+        if st is None or st.blending:
+            return False
+        if st.stage == 0:
+            steps_in_stage = step - st.stage0_start_step
+            gate = mean_rew >= STAGE1_GATE
+            tmax = steps_in_stage >= STAGE1_WAIT
+            if gate or tmax:
+                reason = "reward gate" if gate else f"time limit ({steps_in_stage:,} steps)"
+                print(f"\n    🎓 Stage 0→1 [{reason}]  mean={mean_rew:+.1f}")
+                self._start_blend(from_alpha=0.0, to_alpha=1.0)
+                return True
+        elif st.stage == 1 and len(self.reward_history) >= LOOK_BACK + 1:
+            if mean_rew >= MIN_TRIGGER_REWARD:
+                old_rew = self.reward_history[-(LOOK_BACK + 1)][1]
+                if (mean_rew - old_rew) < IMPROVEMENT_DELTA:
+                    print(f"\n    🎓 Stage 1→2 [hover trap]  mean={mean_rew:+.1f}")
+                    self._start_blend(from_alpha=1.0, to_alpha=2.0)
+                    return True
+        return False
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Artifact saving  (same schema as main.py and CartPole experiment_runner)
@@ -422,6 +512,9 @@ def run_single(condition: Condition, seed: int, run_dir: Path) -> dict:
 
     _save_run(run_dir, cb, condition, seed)
 
+    triggers = (cb._curr_state.advances
+                if condition == "rewardforge" and cb._curr_state is not None
+                else cb.rewrite_count)
     return {
         "condition":      condition,
         "seed":           seed,
@@ -429,7 +522,7 @@ def run_single(condition: Condition, seed: int, run_dir: Path) -> dict:
         "steps_to_0":     steps_to_0,
         "steps_to_100":   steps_to_100,
         "steps_to_200":   steps_to_200,
-        "total_triggers": cb.rewrite_count,
+        "total_triggers": triggers,
         "final_reward":   final_reward,
         "final_std":      cb.log_rows[-1]["std_reward"] if cb.log_rows else 0.0,
     }
