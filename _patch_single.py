@@ -1,100 +1,68 @@
-"""Patch experiment_runner.py: insert _init_single/_tick_single, fix triggers, add analysis."""
-import re
+"""Patch generate_analysis to add catastrophic failure rate and focused comparison table."""
 from pathlib import Path
 
 src = Path("lunarlander/experiment_runner.py")
 text = src.read_text(encoding="utf-8")
 
-# ── 1. Insert _init_single / _tick_single before the module-level save section ──
-single_methods = '''
-    # ── llm_single management ─────────────────────────────────────────────────
-    def _init_single(self) -> None:
-        """Pre-training: call LLM once for the best single reward function."""
-        result = request_single_fn()
-        if result is None:
-            print("  \\u26a0\\ufe0f  llm_single failed \\u2014 using base reward.")
-            return
-        fn, code = result
-        self._single_code  = code
-        self._single_state = SingleFnState()
-        blended = make_single_blend_fn(fn, self._single_state)
-        label   = "llm_single:warmup"
-        self.train_env.reward_fn      = blended
-        self.train_env.reward_fn_code = label
-        self._eval_env.reward_fn      = blended
-        self._eval_env.reward_fn_code = label
-        print(f"  llm_single warmup: alpha 0->1 over {BLEND_STEPS:,} steps")
+old = (
+    '    # \u2500\u2500 Key ablation: does three-stage curriculum beat single LLM fn? \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\r\n'
+    '    if "llm_single" in CONDITIONS:\r\n'
+    '        single_best = [r["best_reward"] for r in results if r["condition"] == "llm_single"]\r\n'
+    '        if single_best and rf_best:\r\n'
+    '            _, p_struct = sp_stats.mannwhitneyu(rf_best, single_best, alternative="two-sided")\r\n'
+    '            sig_struct  = "curriculum IS decisive" if p_struct < 0.05 else "curriculum not sig. vs single fn"\r\n'
+    '            lines += ["",\r\n'
+    '                      f"  rewardforge vs llm_single (two-sided): p={p_struct:.4f}"\r\n'
+    '                      f"  <- {sig_struct}"]\r\n'
+    '\r\n'
+)
 
-    def _tick_single(self) -> None:
-        """Called every step. Warms up alpha 0->1 over BLEND_STEPS, then stays."""
-        st = self._single_state
-        if not st.blending:
-            return
-        elapsed  = self.num_timesteps - st.blend_start_step
-        st.alpha = min(1.0, elapsed / BLEND_STEPS)
-        if elapsed >= BLEND_STEPS:
-            st.blending = False
-            st.advances = 1
-            print(f"\\n    llm_single: full shaping active @ step {self.num_timesteps:,}")
+new = (
+    '    # \u2500\u2500 Key ablation: does three-stage curriculum beat single LLM fn? \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\r\n'
+    '    if "llm_single" in CONDITIONS:\r\n'
+    '        single_best  = [r["best_reward"]  for r in results if r["condition"] == "llm_single"]\r\n'
+    '        single_final = [r["final_reward"] for r in results if r["condition"] == "llm_single"]\r\n'
+    '        single_std   = [r["final_std"]    for r in results if r["condition"] == "llm_single"]\r\n'
+    '        if single_best and rf_best:\r\n'
+    '            _, p_struct = sp_stats.mannwhitneyu(rf_best, single_best, alternative="two-sided")\r\n'
+    '            sig_struct  = "curriculum IS decisive" if p_struct < 0.05 else "curriculum not sig. vs single fn"\r\n'
+    '\r\n'
+    '            rf_final    = [r["final_reward"] for r in results if r["condition"] == "rewardforge"]\r\n'
+    '            rf_std_vals = [r["final_std"]    for r in results if r["condition"] == "rewardforge"]\r\n'
+    '            rf_failures     = sum(1 for x in rf_best     if x < 0)\r\n'
+    '            single_failures = sum(1 for x in single_best if x < 0)\r\n'
+    '\r\n'
+    '            col_rf  = "rewardforge"\r\n'
+    '            col_s   = "llm_single"\r\n'
+    '            lines += [\r\n'
+    '                "",\r\n'
+    '                "  Focused comparison: curriculum RewardForge vs llm_single",\r\n'
+    '                "  " + "-" * 52,\r\n'
+    '                f"  {chr(32)*25} {col_rf:>14}  {col_s:>12}",\r\n'
+    '                f"  {\'median best_reward\':<25} {np.median(rf_best):>+14.1f}  {np.median(single_best):>+12.1f}",\r\n'
+    '                f"  {\'median final_reward\':<25} {np.median(rf_final):>+14.1f}  {np.median(single_final):>+12.1f}",\r\n'
+    '                f"  {\'median final_std\':<25} {np.median(rf_std_vals):>14.1f}  {np.median(single_std):>12.1f}",\r\n'
+    '                f"  {\'catastrophic fails (< 0)\':<25} {rf_failures:>14d}  {single_failures:>12d}",\r\n'
+    '                f"  {\'n seeds\':<25} {len(rf_best):>14d}  {len(single_best):>12d}",\r\n'
+    '                "",\r\n'
+    '                f"  Mann-Whitney U (two-sided): p={p_struct:.4f}  <- {sig_struct}",\r\n'
+    '            ]\r\n'
+    '\r\n'
+)
 
-'''
-
-anchor1 = "\n# \u2550" * 1  # won't match; use exact string below
-anchor1 = "\n\n\n# \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\n# Artifact saving"
-
-if anchor1 in text:
-    text = text.replace(anchor1, single_methods + anchor1, 1)
-    print("Inserted _init_single/_tick_single")
+if old in text:
+    text = text.replace(old, new, 1)
+    print("Patched generate_analysis with failure rate reporting")
 else:
-    print("WARN: anchor1 not found, trying shorter match")
-    # Try simpler anchor
-    anchor1b = "\n# Artifact saving  (same schema as main.py and CartPole experiment_runner)"
-    if anchor1b in text:
-        text = text.replace(anchor1b, "\n" + single_methods.strip() + "\n\n" + anchor1b.strip(), 1)
-        print("Inserted via anchor1b")
+    print("WARN: anchor not found - trying without \\r")
+    old2 = old.replace('\r\n', '\n')
+    new2 = new.replace('\r\n', '\n')
+    if old2 in text:
+        text = text.replace(old2, new2, 1)
+        print("Patched (LF-style)")
     else:
-        print("WARN: could not find insertion anchor")
-
-# ── 2. Fix triggers in run_single ──────────────────────────────────────────────
-old_triggers = (
-    "    triggers = (cb._curr_state.advances\n"
-    "                if condition == \"rewardforge\" and cb._curr_state is not None\n"
-    "                else cb.rewrite_count)\n"
-)
-new_triggers = (
-    "    if condition == \"rewardforge\" and cb._curr_state is not None:\n"
-    "        triggers = cb._curr_state.advances\n"
-    "    elif condition == \"llm_single\" and cb._single_state is not None:\n"
-    "        triggers = cb._single_state.advances\n"
-    "    else:\n"
-    "        triggers = cb.rewrite_count\n"
-)
-if old_triggers in text:
-    text = text.replace(old_triggers, new_triggers, 1)
-    print("Fixed triggers")
-else:
-    print("WARN: triggers anchor not found")
-
-# ── 3. Add rewardforge vs llm_single to generate_analysis ──────────────────────
-old_conclusion = "    # ── Plain-English conclusion"
-new_analysis = (
-    '    # ── Key ablation: does three-stage curriculum beat single LLM fn? ─────────\n'
-    '    if "llm_single" in CONDITIONS:\n'
-    '        single_best = [r["best_reward"] for r in results if r["condition"] == "llm_single"]\n'
-    '        if single_best and rf_best:\n'
-    '            _, p_struct = sp_stats.mannwhitneyu(rf_best, single_best, alternative="two-sided")\n'
-    '            sig_struct  = "curriculum IS decisive" if p_struct < 0.05 else "curriculum not sig. vs single fn"\n'
-    '            lines += ["",\n'
-    '                      f"  rewardforge vs llm_single (two-sided): p={p_struct:.4f}"\n'
-    '                      f"  <- {sig_struct}"]\n'
-    '\n'
-    '    # ── Plain-English conclusion'
-)
-if old_conclusion in text:
-    text = text.replace(old_conclusion, new_analysis, 1)
-    print("Added llm_single analysis comparison")
-else:
-    print("WARN: conclusion anchor not found")
+        print("ERROR: could not find anchor")
+        raise SystemExit(1)
 
 src.write_text(text, encoding="utf-8")
-print("Patch complete.")
+print("Done.")

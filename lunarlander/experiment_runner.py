@@ -94,21 +94,19 @@ MIN_TRIGGER_REWARD = 0.0      # agent must be positive -- hovering, not crashing
 # (700 prompt + 150 code).  12K / 850 = ~14 calls/min max.  10s gap = safe.
 LLM_CALL_DELAY_S = 10        # seconds to sleep before each LLM call
 
-SEEDS      = list(range(10))    # seeds 0-9 (v5 — doubled for statistical power)
-CONDITIONS = ["rewardforge", "baseline_ppo", "ablation_blind",
-               "ablation_random", "llm_single"]
+SEEDS      = list(range(20))    # seeds 0-19 (v8 — 20 seeds for statistical power)
+CONDITIONS = ["rewardforge", "llm_single"]
 
 # Human-readable label appended to the experiment folder name.
 # Change this whenever you change the experiment setup so folders are identifiable.
 # e.g. "v6_curriculum", "v7_curriculum_llm_single", "debug_3seeds"
-RUN_LABEL  = "v7_curriculum_llm_single"   # <-- update before each run
+RUN_LABEL  = "v8_two_condition_20seeds"   # <-- update before each run
 
 # EXPR_ROOT is set inside main() with a timestamp + label.
 # e.g.  runs/experiments/lunarlander/20260412_181054_v7_curriculum_llm_single/
 _EXPR_BASE = _ROOT / "runs" / "experiments" / "lunarlander"
 
-Condition = Literal["rewardforge", "baseline_ppo", "ablation_blind",
-                    "ablation_random", "llm_single"]
+Condition = Literal["rewardforge", "llm_single"]
 
 # ── Literature reference constants (hardcoded — no rerun needed) ──────────────
 # SB3 Zoo PPO LunarLander-v2 after 1,000,000 steps
@@ -661,13 +659,33 @@ def generate_analysis(results: list[dict], out_path: Path) -> str:
 
     # ── Key ablation: does three-stage curriculum beat single LLM fn? ─────────
     if "llm_single" in CONDITIONS:
-        single_best = [r["best_reward"] for r in results if r["condition"] == "llm_single"]
+        single_best  = [r["best_reward"]  for r in results if r["condition"] == "llm_single"]
+        single_final = [r["final_reward"] for r in results if r["condition"] == "llm_single"]
+        single_std   = [r["final_std"]    for r in results if r["condition"] == "llm_single"]
         if single_best and rf_best:
             _, p_struct = sp_stats.mannwhitneyu(rf_best, single_best, alternative="two-sided")
             sig_struct  = "curriculum IS decisive" if p_struct < 0.05 else "curriculum not sig. vs single fn"
-            lines += ["",
-                      f"  rewardforge vs llm_single (two-sided): p={p_struct:.4f}"
-                      f"  <- {sig_struct}"]
+
+            rf_final    = [r["final_reward"] for r in results if r["condition"] == "rewardforge"]
+            rf_std_vals = [r["final_std"]    for r in results if r["condition"] == "rewardforge"]
+            rf_failures     = sum(1 for x in rf_best     if x < 0)
+            single_failures = sum(1 for x in single_best if x < 0)
+
+            col_rf  = "rewardforge"
+            col_s   = "llm_single"
+            lines += [
+                "",
+                "  Focused comparison: curriculum RewardForge vs llm_single",
+                "  " + "-" * 52,
+                f"  {chr(32)*25} {col_rf:>14}  {col_s:>12}",
+                f"  {'median best_reward':<25} {np.median(rf_best):>+14.1f}  {np.median(single_best):>+12.1f}",
+                f"  {'median final_reward':<25} {np.median(rf_final):>+14.1f}  {np.median(single_final):>+12.1f}",
+                f"  {'median final_std':<25} {np.median(rf_std_vals):>14.1f}  {np.median(single_std):>12.1f}",
+                f"  {'catastrophic fails (< 0)':<25} {rf_failures:>14d}  {single_failures:>12d}",
+                f"  {'n seeds':<25} {len(rf_best):>14d}  {len(single_best):>12d}",
+                "",
+                f"  Mann-Whitney U (two-sided): p={p_struct:.4f}  <- {sig_struct}",
+            ]
 
     # ── Plain-English conclusion ──────────────────────────────────────────────
     lines += ["", sep, "Conclusion:", sep]
