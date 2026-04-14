@@ -55,9 +55,9 @@ from highway.highway_agent import (                             # noqa: E402
 # ═══════════════════════════════════════════════════════════════════════════════
 # Configuration
 # ═══════════════════════════════════════════════════════════════════════════════
-TOTAL_TIMESTEPS   = 30_000    # 161 steps/sec → ~3 min/seed, ~60 min for 20 seeds
-CHECKPOINT_EVERY  = 3_000     # 10 checkpoints per run
-N_EVAL_EPISODES   = 5         # 5 ep × 30 steps = 150 eval steps each checkpoint
+TOTAL_TIMESTEPS   = 100_000    # 161 steps/sec → ~3 min/seed, ~60 min for 20 seeds
+CHECKPOINT_EVERY  = 10_000     # 10 checkpoints per run
+N_EVAL_EPISODES   = 10         # 10 ep × 30 steps = 300 eval steps each checkpoint
 
 SEEDS      = list(range(10))
 CONDITIONS = ["llm_single", "baseline_ppo"]

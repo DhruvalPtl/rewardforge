@@ -90,7 +90,7 @@ def request_single_fn() -> tuple | None:
     Ask the LLM for the best single BipedalWalker reward function.
     Returns (fn, code_str) or None on failure.
     """
-    print(f"\n\U0001f52e  Calling Groq ({_MODEL}) for BipedalWalker reward function …")
+    print(f"\n\U0001f52e  Calling Groq ({_MODEL}) for BipedalWalker reward function ?")
     try:
         time.sleep(10)
         response = _CLIENT.chat.completions.create(
