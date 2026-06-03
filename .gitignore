@@ -4,3 +4,6 @@ __pycache__/
 runs/
 *.zip
 .DS_Store
+_fix_ascii.py
+_patch_single.py
+_append_single.py
